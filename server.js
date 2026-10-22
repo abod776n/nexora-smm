@@ -505,6 +505,15 @@ function ensureReady() {
     await init();
     await ensureAdmin();
     ensureServices().catch(err => console.error('[bootstrap]', err.message));
+    // Register the Telegram webhook once per deployment (serverless only:
+    // there is no long-running process to keep polling alive).
+    if (SERVERLESS && process.env.PUBLIC_URL) {
+      const marker = await getSetting('telegram_webhook_url', '');
+      if (marker !== process.env.PUBLIC_URL) {
+        await storeBot().startWebhook(process.env.PUBLIC_URL);
+        await setSetting('telegram_webhook_url', process.env.PUBLIC_URL);
+      }
+    }
   })());
 }
 

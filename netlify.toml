@@ -1,5 +1,8 @@
 [build]
   publish = "public"
+
+[build.environment]
+  NODE_VERSION = "22"
   command = "npm ci --omit=dev || npm install --omit=dev"
 
 [functions]
