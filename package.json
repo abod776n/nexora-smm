@@ -1,0 +1,26 @@
+{
+  "name": "tota-smm",
+  "version": "1.0.0",
+  "description": "SMM panel for social media services — catalog, orders, wallet, admin dashboard, Tota provider integration",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js",
+    "dev": "node --watch --env-file-if-exists=.env server.js"
+  },
+  "keywords": [
+    "smm",
+    "panel",
+    "telegram",
+    "social-media"
+  ],
+  "author": "",
+  "license": "ISC",
+  "engines": {
+    "node": ">=22.9"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.18.0",
+    "express": "^4.22.3",
+    "multer": "^2.5.0"
+  }
+}
