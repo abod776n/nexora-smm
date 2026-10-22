@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node --env-file-if-exists=.env server.js",
-    "dev": "node --watch --env-file-if-exists=.env server.js"
+    "dev": "node --watch --env-file-if-exists=.env server.js",
+    "test": "node test/pg-dialect.js"
   },
   "keywords": [
     "smm",
@@ -20,8 +21,13 @@
   },
   "dependencies": {
     "@libsql/client": "^0.18.0",
+    "@netlify/database": "^2.0.1",
     "express": "^4.22.3",
     "multer": "^2.5.0",
+    "pg": "^8.23.1",
     "serverless-http": "^3.2.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.2.17"
   }
 }

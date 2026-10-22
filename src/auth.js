@@ -57,7 +57,9 @@ async function userFromRequest(req) {
 }
 
 function sessionCookie(token) {
-  const secure = process.env.SECURE_COOKIES === '1' ? '; Secure' : '';
+  // Netlify (and any host behind HTTPS it announces via URL) is always https.
+  const httpsHost = /^https:/i.test(String(process.env.URL || process.env.PUBLIC_URL || ''));
+  const secure = process.env.SECURE_COOKIES === '1' || httpsHost ? '; Secure' : '';
   return `session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}${secure}`;
 }
 

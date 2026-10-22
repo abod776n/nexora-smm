@@ -5,7 +5,8 @@ const fs = require('node:fs');
 const crypto = require('node:crypto');
 const express = require('express');
 const multer = require('multer');
-const { all, get, run, batch, init, getSetting, setSetting } = require('./src/db');
+const db = require('./src/db');
+const { all, get, run, batch, init, getSetting, setSetting } = db;
 const auth = require('./src/auth');
 const tota = require('./src/tota');
 const views = require('./src/views');
@@ -30,6 +31,10 @@ app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1h' }));
 // survive container updates (workspace is persistent).
 // Serverless (Netlify) has a read-only project FS: receipts go to /tmp there.
 const SERVERLESS = Boolean(process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME);
+// Netlify sets URL itself, so the owner only needs PUBLIC_URL on other hosts.
+const PUBLIC_BASE = String(
+  process.env.PUBLIC_URL || process.env.URL || process.env.DEPLOY_PRIME_URL || ''
+).replace(/\/$/, '');
 const UPLOAD_DIR = process.env.UPLOAD_DIR || (SERVERLESS ? '/tmp/uploads' : path.join(__dirname, 'uploads'));
 try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch (err) { console.error('[uploads]', err.message); }
 const upload = multer({
@@ -278,9 +283,18 @@ app.post('/topup', requireUser, uploadReceipt, wrap(async (req, res) => {
     return fail(res, '/topup', 'اكتب رقم العملية أو المرجع.');
   }
   if (!receipt) return fail(res, '/topup', 'أرفق صورة إشعار التحويل.');
+  // Serverless has no persistent disk: keep the receipt bytes in the database
+  // so the admin can still open the receipt after a cold start.
+  let photoData = null;
+  if (SERVERLESS) {
+    try {
+      photoData = fs.readFileSync(path.join(UPLOAD_DIR, receipt)).toString('base64');
+      fs.unlink(path.join(UPLOAD_DIR, receipt), () => {});
+    } catch (err) { console.error('[receipt]', err.message); }
+  }
   const created = await run(
-    'INSERT INTO deposits (user_id, amount, method, reference, note, photo_path) VALUES (?, ?, ?, ?, ?, ?)',
-    req.user.id, amount, method, reference, 'إيداع من الموقع', receipt
+    'INSERT INTO deposits (user_id, amount, method, reference, note, photo_path, photo_data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    req.user.id, amount, method, reference, 'إيداع من الموقع', receipt, photoData
   );
   ok(res, '/topup', 'تم إرسال طلب الشحن مع صورة الإشعار. سيُضاف الرصيد بعد المراجعة.');
   storeBot().notifyDeposit(created.lastInsertRowid).catch(err =>
@@ -349,8 +363,13 @@ app.post('/admin/deposits/:id/reject', requireAdmin, wrap(async (req, res) => {
 }));
 
 app.get('/admin/deposits/:id/photo', requireAdmin, wrap(async (req, res) => {
-  const d = await get('SELECT photo_path FROM deposits WHERE id = ?', Number(req.params.id));
-  if (!d || !d.photo_path) return res.status(404).send('Not found');
+  const d = await get('SELECT photo_path, photo_data FROM deposits WHERE id = ?', Number(req.params.id));
+  if (!d) return res.status(404).send('Not found');
+  if (d.photo_data) {
+    res.type(path.extname(d.photo_path || '') || '.jpg');
+    return res.send(Buffer.from(d.photo_data, 'base64'));
+  }
+  if (!d.photo_path) return res.status(404).send('Not found');
   const file = path.join(UPLOAD_DIR, path.basename(d.photo_path));
   if (!fs.existsSync(file)) return res.status(404).send('Not found');
   res.sendFile(file);
@@ -457,7 +476,16 @@ app.post('/telegram/webhook', wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
-app.get('/healthz', (req, res) => res.json({ ok: true, time: nowIso() }));
+app.get('/healthz', (req, res) => res.json({
+  ok: true,
+  time: nowIso(),
+  db: db.mode,
+  // A serverless run without a real database URL writes to /tmp and loses
+  // everything between cold starts — surfaced here so it is caught immediately.
+  ephemeral: SERVERLESS && db.mode === 'file',
+  bot: Boolean(process.env.STORE_BOT_TOKEN),
+  provider: Boolean(process.env.TOTA_API_KEY),
+}));
 
 app.use(async (err, req, res, next) => {
   console.error(err);
@@ -500,18 +528,30 @@ async function ensureServices() {
 let readyPromise = null;
 // Runs once per process: schema, admin account, first service sync. Called by
 // main() in server mode and by the Netlify function on every cold start.
+function withTimeout(promise, ms) {
+  let timer;
+  const guard = new Promise(resolve => { timer = setTimeout(resolve, ms); });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
 function ensureReady() {
   return (readyPromise ||= (async () => {
     await init();
     await ensureAdmin();
-    ensureServices().catch(err => console.error('[bootstrap]', err.message));
+    // Lambda freezes the process the moment the response is sent, so a
+    // fire-and-forget sync would never finish on a cold start. Await it, but
+    // only briefly: a slow provider must not hang the first page view. If it
+    // is cut off, the next cold start (services still empty) tries again, and
+    // the admin always has the manual sync button.
+    const bootstrapServices = SERVERLESS ? withTimeout(ensureServices(), 7000) : ensureServices();
+    await bootstrapServices.catch(err => console.error('[bootstrap]', err.message));
     // Register the Telegram webhook once per deployment (serverless only:
     // there is no long-running process to keep polling alive).
-    if (SERVERLESS && process.env.PUBLIC_URL) {
+    if (SERVERLESS && PUBLIC_BASE) {
       const marker = await getSetting('telegram_webhook_url', '');
-      if (marker !== process.env.PUBLIC_URL) {
-        await storeBot().startWebhook(process.env.PUBLIC_URL);
-        await setSetting('telegram_webhook_url', process.env.PUBLIC_URL);
+      if (marker !== PUBLIC_BASE) {
+        await storeBot().startWebhook(PUBLIC_BASE);
+        await setSetting('telegram_webhook_url', PUBLIC_BASE);
       }
     }
   })());
@@ -521,7 +561,7 @@ async function main() {
   await ensureReady();
   app.listen(PORT, () => console.log(`[tota-smm] listening on http://localhost:${PORT}`));
   if (String(process.env.BOT_MODE || 'polling').toLowerCase() === 'webhook') {
-    storeBot().startWebhook(process.env.PUBLIC_URL || '').catch(err => console.error('[bot]', err.message));
+    storeBot().startWebhook(PUBLIC_BASE).catch(err => console.error('[bot]', err.message));
   } else {
     storeBot().start().catch(err => console.error('[bot]', err.message));
   }

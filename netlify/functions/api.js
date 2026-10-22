@@ -6,7 +6,11 @@
 const serverless = require('serverless-http');
 const { app, ensureReady } = require('../../server');
 
-const handler = serverless(app);
+// Receipt images are served as real bytes; without this the function base64-
+// encodes text and the browser gets a broken picture.
+const handler = serverless(app, {
+  binary: ['image/*', 'application/pdf', 'application/octet-stream'],
+});
 
 exports.handler = async (event, context) => {
   context.callbackWaitsForEmptyEventLoop = false;
