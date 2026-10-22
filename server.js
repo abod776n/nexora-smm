@@ -28,8 +28,10 @@ app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1h' }));
 
 // Receipt photos for wallet deposits. Kept inside the app folder so they
 // survive container updates (workspace is persistent).
-const UPLOAD_DIR = path.join(__dirname, 'uploads');
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+// Serverless (Netlify) has a read-only project FS: receipts go to /tmp there.
+const SERVERLESS = Boolean(process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME);
+const UPLOAD_DIR = process.env.UPLOAD_DIR || (SERVERLESS ? '/tmp/uploads' : path.join(__dirname, 'uploads'));
+try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch (err) { console.error('[uploads]', err.message); }
 const upload = multer({
   storage: multer.diskStorage({
     destination: UPLOAD_DIR,
@@ -440,6 +442,21 @@ app.post('/admin/sync-services', requireAdmin, wrap(async (req, res) => {
   }
 }));
 
+// Telegram webhook (serverless mode). Long polling cannot run on Netlify, so
+// the store bot is driven by Telegram POSTing updates here.
+app.post('/telegram/webhook', wrap(async (req, res) => {
+  const secret = process.env.WEBHOOK_SECRET || '';
+  if (secret && req.get('x-telegram-bot-api-secret-token') !== secret) {
+    return res.status(403).send('Forbidden');
+  }
+  try {
+    await storeBot().handleUpdate(req.body || {});
+  } catch (err) {
+    console.error('[bot] update failed:', err.message);
+  }
+  res.json({ ok: true });
+}));
+
 app.get('/healthz', (req, res) => res.json({ ok: true, time: nowIso() }));
 
 app.use(async (err, req, res, next) => {
@@ -480,17 +497,32 @@ async function ensureServices() {
   }
 }
 
-async function main() {
-  await init();
-  await ensureAdmin();
-  app.listen(PORT, () => console.log(`[tota-smm] listening on http://localhost:${PORT}`));
-  require('./bot/bot').start().catch(err => console.error('[bot]', err.message));
-  ensureServices().catch(err => console.error('[bootstrap]', err.message));
+let readyPromise = null;
+// Runs once per process: schema, admin account, first service sync. Called by
+// main() in server mode and by the Netlify function on every cold start.
+function ensureReady() {
+  return (readyPromise ||= (async () => {
+    await init();
+    await ensureAdmin();
+    ensureServices().catch(err => console.error('[bootstrap]', err.message));
+  })());
 }
 
-main().catch(err => {
-  console.error('[tota-smm] startup failed:', err);
-  process.exit(1);
-});
+async function main() {
+  await ensureReady();
+  app.listen(PORT, () => console.log(`[tota-smm] listening on http://localhost:${PORT}`));
+  if (String(process.env.BOT_MODE || 'polling').toLowerCase() === 'webhook') {
+    storeBot().startWebhook(process.env.PUBLIC_URL || '').catch(err => console.error('[bot]', err.message));
+  } else {
+    storeBot().start().catch(err => console.error('[bot]', err.message));
+  }
+}
 
-module.exports = { app };
+if (require.main === module) {
+  main().catch(err => {
+    console.error('[tota-smm] startup failed:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = { app, ensureReady };

@@ -6,7 +6,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { all, get, run, batch, getSetting } = require('../src/db');
+const { all, get, run, batch, getSetting, setSetting } = require('../src/db');
 
 // Deliberately NOT BOT_TOKEN: the container injects BOT_TOKEN for the personal
 // assistant bot, which the platform polls itself. A second getUpdates on it
@@ -20,25 +20,27 @@ let offset = 0;
 let running = false;
 
 // Per-chat conversation state (custom star amount / deposit flow).
-// In memory: a restart drops half-finished dialogs, which is acceptable.
-const states = new Map();
+// Kept in the settings table: a restart — or a serverless cold start between
+// two messages — must not drop a half-finished dialog.
 const STATE_TTL = 15 * 60 * 1000;
+const stateKey = chatId => `bot_state:${chatId}`;
 
-function setState(chatId, state) {
-  states.set(String(chatId), { ...state, at: Date.now() });
+async function setState(chatId, state) {
+  await setSetting(stateKey(chatId), JSON.stringify({ ...state, at: Date.now() }));
 }
-function getState(chatId) {
-  const key = String(chatId);
-  const st = states.get(key);
-  if (!st) return null;
-  if (Date.now() - st.at > STATE_TTL) {
-    states.delete(key);
+async function getState(chatId) {
+  const raw = await getSetting(stateKey(chatId), null);
+  if (!raw) return null;
+  let st = null;
+  try { st = JSON.parse(raw); } catch { st = null; }
+  if (!st || Date.now() - Number(st.at || 0) > STATE_TTL) {
+    await clearState(chatId);
     return null;
   }
   return st;
 }
-function clearState(chatId) {
-  states.delete(String(chatId));
+async function clearState(chatId) {
+  await run('DELETE FROM settings WHERE key = ?', stateKey(chatId));
 }
 
 async function call(method, payload = {}) {
@@ -113,7 +115,7 @@ async function askCustomStars(chatId, telegramId) {
   const user = await userByTelegram(telegramId);
   if (!user) return send(chatId, 'اربط حسابك أولاً من صفحة «حسابي» في الموقع، ثم أعد المحاولة.');
   const rate = await starRate();
-  setState(chatId, { step: 'stars', telegramId });
+  await setState(chatId, { step: 'stars', telegramId });
   return send(chatId,
     `اكتب عدد النجوم الذي تريده (من ${STAR_MIN} إلى ${STAR_MAX}).\n` +
     `سعر النجمة: ${fmt(rate)} — مثال: 37 نجمة = ${fmt(37 * rate)}.\n\n` +
@@ -238,7 +240,7 @@ async function pickDepositMethod(chatId, telegramId, index) {
   const w = wallets[index];
   if (!w) return send(chatId, 'الوسيلة غير متاحة، أرسل /deposit من جديد.');
   const dest = w.url ? `${w.number}` : (w.number || '—');
-  setState(chatId, { step: 'dep_amount', telegramId, method: w.name });
+  await setState(chatId, { step: 'dep_amount', telegramId, method: w.name });
   return send(chatId,
     `الوسيلة: ${w.name}\nالوجهة: ${dest}${w.holder ? `\nالاسم: ${w.holder}` : ''}\n\n` +
     'بعد التحويل اكتب المبلغ بالدولار (مثال: 10).\nأرسل /cancel للإلغاء.');
@@ -252,14 +254,14 @@ async function onDepositAmount(chatId, state, text) {
   }
   if (amount < min) return send(chatId, `أقل مبلغ شحن هو ${fmt(min)}.`);
   if (amount > 10000) return send(chatId, 'المبلغ كبير جداً. راسل الإدارة مباشرة.');
-  setState(chatId, { ...state, step: 'dep_reference', amount: Math.round(amount * 100) / 100 });
+  await setState(chatId, { ...state, step: 'dep_reference', amount: Math.round(amount * 100) / 100 });
   return send(chatId, 'اكتب رقم عملية التحويل كما يظهر في إشعار المحفظة.');
 }
 
 async function onDepositReference(chatId, state, text) {
   const reference = String(text).trim().slice(0, 120);
   if (reference.length < 3) return send(chatId, 'رقم العملية قصير جداً. اكتب رقم العملية كاملاً.');
-  setState(chatId, { ...state, step: 'dep_photo', reference });
+  await setState(chatId, { ...state, step: 'dep_photo', reference });
   return send(chatId, 'أرسل الآن صورة إشعار الإيداع (لقطة الشاشة).');
 }
 
@@ -331,7 +333,7 @@ async function notifyDeposit(depositId) {
 async function onDepositPhoto(chatId, state, message) {
   const user = await userByTelegram(state.telegramId);
   if (!user) {
-    clearState(chatId);
+    await clearState(chatId);
     return send(chatId, 'حسابك غير مرتبط. اربطه من صفحة «حسابي».');
   }
   const photo = message.photo[message.photo.length - 1];
@@ -344,7 +346,7 @@ async function onDepositPhoto(chatId, state, message) {
     user.id, state.amount, state.method, state.reference, 'إيداع عبر البوت', fileId
   );
   const depositId = created.lastInsertRowid;
-  clearState(chatId);
+  await clearState(chatId);
 
   await send(chatId,
     `تم استلام طلب الإيداع #${depositId}.\nالمبلغ: ${fmt(state.amount)} — ${state.method}\n` +
@@ -418,7 +420,7 @@ async function onCommand(message, text) {
   }
   if (cmd === '/link') return linkUser(chatId, telegramId, username, rest[0]);
   if (cmd === '/cancel' || cmd === '/الغاء') {
-    clearState(chatId);
+    await clearState(chatId);
     return send(chatId, 'تم الإلغاء.');
   }
   if (cmd === '/balance' || cmd === '/رصيد') return balance(chatId, telegramId);
@@ -467,11 +469,11 @@ async function onUpdate(update) {
 
   // Commands always win and reset any pending dialog (except /cancel handling below).
   if (text.startsWith('/')) {
-    if (!/^\/(cancel|الغاء)(@|$|\s)/i.test(text)) clearState(chatId);
+    if (!/^\/(cancel|الغاء)(@|$|\s)/i.test(text)) await clearState(chatId);
     return onCommand(message, text);
   }
 
-  const state = getState(chatId);
+  const state = await getState(chatId);
   if (!state) {
     if (message.photo) {
       return send(chatId, 'لإرسال إيداع أرسل /deposit أولاً.');
@@ -484,7 +486,7 @@ async function onUpdate(update) {
     if (!Number.isInteger(stars) || stars < STAR_MIN || stars > STAR_MAX) {
       return send(chatId, `اكتب عدداً صحيحاً بين ${STAR_MIN} و${STAR_MAX}، مثال: 37. أو /cancel للإلغاء.`);
     }
-    clearState(chatId);
+    await clearState(chatId);
     return sendInvoice(chatId, state.telegramId || String(message.from.id), stars);
   }
   if (state.step === 'dep_amount') return onDepositAmount(chatId, state, text);
@@ -534,4 +536,37 @@ async function start() {
   poll();
 }
 
-module.exports = { start, notifyDeposit };
+// One update, called by the webhook route (serverless mode).
+async function handleUpdate(update) {
+  try {
+    await onUpdate(update || {});
+  } catch (err) {
+    console.error('[bot] update failed:', err.message);
+  }
+}
+
+// Register the webhook with Telegram so updates are delivered to the site.
+// Used instead of long polling where the process does not stay alive.
+async function startWebhook(baseUrl) {
+  if (!TOKEN) {
+    console.log('[bot] STORE_BOT_TOKEN not set — store bot disabled');
+    return;
+  }
+  if (!baseUrl) {
+    console.log('[bot] PUBLIC_URL not set — webhook not registered');
+    return;
+  }
+  try {
+    const me = await call('getMe');
+    if (!process.env.STORE_BOT_USERNAME) process.env.STORE_BOT_USERNAME = me.username;
+    const url = `${String(baseUrl).replace(/\/$/, '')}/telegram/webhook`;
+    const payload = { url, allowed_updates: ['message', 'callback_query', 'pre_checkout_query'] };
+    if (process.env.WEBHOOK_SECRET) payload.secret_token = process.env.WEBHOOK_SECRET;
+    await call('setWebhook', payload);
+    console.log(`[bot] webhook set to ${url} (@${me.username})`);
+  } catch (err) {
+    console.error('[bot] webhook setup failed:', err.message);
+  }
+}
+
+module.exports = { start, startWebhook, handleUpdate, notifyDeposit };

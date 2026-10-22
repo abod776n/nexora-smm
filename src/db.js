@@ -11,7 +11,10 @@ let client;
 if (REMOTE) {
   client = createClient({ url: REMOTE_URL, authToken: process.env.TURSO_AUTH_TOKEN || undefined });
 } else {
-  const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
+  // Serverless has a read-only project FS — fall back to /tmp so a missing
+  // TURSO_DATABASE_URL degrades into a fresh ephemeral DB, not a crash.
+  const ephemeral = process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME;
+  const DATA_DIR = process.env.DATA_DIR || (ephemeral ? '/tmp/data' : path.join(__dirname, '..', 'data'));
   fs.mkdirSync(DATA_DIR, { recursive: true });
   client = createClient({ url: 'file:' + path.join(DATA_DIR, 'app.db') });
 }
